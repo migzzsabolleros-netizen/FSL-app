@@ -1,7 +1,7 @@
 fastapi==0.136.1
 uvicorn==0.46.0
 opencv-python-headless==4.11.0.86
-mediapipe==0.10.35
+mediapipe==0.10.14
 tensorflow==2.15.0
 numpy==1.24.3
 passlib==1.7.4
