@@ -8,3 +8,4 @@ passlib==1.7.4
 bcrypt==4.0.1
 supabase==2.29.0
 python-dotenv==1.2.2
+gdown==5.2.0
