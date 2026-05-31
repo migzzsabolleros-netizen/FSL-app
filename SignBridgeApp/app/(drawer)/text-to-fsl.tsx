@@ -1,4 +1,4 @@
-﻿import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity,
   TextInput, Alert, ActivityIndicator, ScrollView
@@ -15,7 +15,10 @@ async function getGlossSequence(
   sentence: string,
   availableClips: string[],
 ): Promise<string[]> {
-  const clipList = availableClips.filter(c => c.toLowerCase() !== 'idle').join(', ');
+  const clipList = availableClips.filter(c => {
+    const lower = c.toLowerCase();
+    return lower !== 'idle' && lower !== 'action';
+  }).join(', ');
 
   const prompt = `You are an expert Filipino Sign Language (FSL) interpreter.
 
@@ -35,7 +38,7 @@ Example: "Basahin ang libro" -> ["Basahin","Libro"]
 
 Respond with ONLY the JSON array, nothing else.`;
 
-  const API_KEY = 'AIzaSyDVOcg6C_3qH9Flpp2zRHPMJ_7wXWkB3y8';
+  const API_KEY = 'AQ.Ab8RN6IFetw4fJWVmuxvv31xo55odpJSlQkRrrs_Fgc0Ij3zRA';
   const MODEL   = 'gemini-2.5-flash-lite';
 
   const response = await fetch(
@@ -95,7 +98,7 @@ function buildHtml(glbUri: string): string {
 
     /* ── NOW-SIGNING BANNER (cleaned: no rounded rect, smaller & lower) ── */
     #now-signing {
-      position:absolute; bottom:28px; left:0; right:0;
+      position:absolute; bottom:40px; left:0; right:0;
       display:none; flex-direction:column; align-items:center;
       pointer-events:none;
     }
@@ -184,6 +187,9 @@ function buildHtml(glbUri: string): string {
       if (window.ReactNativeWebView)
         window.ReactNativeWebView.postMessage(JSON.stringify({ type, ...payload }));
     }
+    function sleep(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
+    }
     function fetchBuffer(uri, onProgress) {
       return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
@@ -217,7 +223,7 @@ function buildHtml(glbUri: string): string {
 
     const ambientLight = new THREE.AmbientLight(0xffffff, 2.8);
     scene.add(ambientLight);
-    const frontLight = new THREE.PointLight(0xffffff, 5.0, 3.5);
+    const frontLight = new THREE.PointLight(0xffffff, 6.0, 1.5);
     scene.add(frontLight);
     const leftFill  = new THREE.PointLight(0xfff6ee, 2.5, 2.5);
     scene.add(leftFill);
@@ -298,17 +304,25 @@ function buildHtml(glbUri: string): string {
       a.time = 0;
       a.setEffectiveTimeScale(1);
       a.setEffectiveWeight(1);
-      a.setLoop(THREE.LoopRepeat, Infinity);
-      a.clampWhenFinished = false;
-      a.play();
+      const isStaticIdle = AC_idleName?.toLowerCase() === 'idle';
+      if (isStaticIdle) {
+        a.setLoop(THREE.LoopOnce, 1);
+        a.clampWhenFinished = true;
+        a.play();
+        a.paused = true;
+      } else {
+        a.setLoop(THREE.LoopRepeat, Infinity);
+        a.clampWhenFinished = false;
+        a.play();
+      }
       _liveAction = a;
-      dbg('idle playing — dur:' + a.getClip().duration.toFixed(2) + 's running:' + a.isRunning(), 'ok');
+      dbg('idle playing — dur:' + a.getClip().duration.toFixed(2) + 's running:' + a.isRunning() + (isStaticIdle ? ' [static idle]' : ''), 'ok');
     }
 
     // ── playOnce: rAF-poll based — immune to setTimeout throttling ────────
     // Resolves when action.time >= clip.duration (i.e. animation finished).
     // Does NOT rely on mixer 'finished' event or setTimeout.
-    function AC_playOnce(name, myGen) {
+    function AC_playOnce(name, myGen, timeScale = 1) {
       return new Promise(resolve => {
         const a = getAction(name);
         if (!a) {
@@ -319,7 +333,7 @@ function buildHtml(glbUri: string): string {
 
         const clip = a.getClip();
         const dur  = clip.duration;
-        dbg('playOnce → ' + name + ' dur:' + dur.toFixed(3) + 's', 'info');
+        dbg('playOnce → ' + name + ' dur:' + dur.toFixed(3) + 's timeScale:' + timeScale.toFixed(2), 'info');
 
         // Stop everything else, then configure this action
         hardStopAll(a);
@@ -327,7 +341,7 @@ function buildHtml(glbUri: string): string {
         a.paused  = false;
         a.reset();
         a.time = 0;
-        a.setEffectiveTimeScale(1);
+        a.setEffectiveTimeScale(timeScale);
         a.setEffectiveWeight(1);
         a.setLoop(THREE.LoopOnce, 1);
         a.clampWhenFinished = true;  // keeps pose on last frame
@@ -402,14 +416,16 @@ function buildHtml(glbUri: string): string {
         if (AC_seqGen !== myGen) { dbg('sequence superseded before: ' + w, 'warn'); return; }
         if (!clips[w])           { dbg('no clip: ' + w + ' — skip', 'err'); continue; }
         dbg('signing: ' + w, 'info');
-        const result = await AC_playOnce(w, myGen);
+        const result = await AC_playOnce(w, myGen, 0.82);
         dbg('signed: ' + w + ' result:' + result, 'ok');
         if (result === 'superseded') return;
+        await sleep(100);
       }
 
       AC_signing = false;
       dbg('sequence DONE', 'ok');
       postRN('sequenceDone');
+      await sleep(380);
       AC_goIdle();
     }
 
@@ -429,6 +445,7 @@ function buildHtml(glbUri: string): string {
 
       AC_signing = false;
       postRN('sequenceDone');
+      await sleep(280);
       AC_goIdle();
     }
 
@@ -475,10 +492,10 @@ function buildHtml(glbUri: string): string {
       camera.position.set(0, 0.25, 2.35);
       camera.lookAt(0, 0.35, 0);
 
-      frontLight.position.set(0,    1.2,  1.5);
-      leftFill.position.set(-1.0,   1.0,  1.0);
-      rightFill.position.set(1.0,   1.0,  1.0);
-      rimLight.position.set(0,      1.8, -1.0);
+      frontLight.position.set(0,    0.25,  1.9);
+      leftFill.position.set(-1.0,   0.5,  0.5);
+      rightFill.position.set(1.0,   0.5,  0.5);
+      rimLight.position.set(0,      0.8, -1.0);
 
       let meshCount = 0;
       gltf.scene.traverse(obj => {
@@ -512,7 +529,10 @@ function buildHtml(glbUri: string): string {
 
       dbg('Total clips: ' + names.length + ' | ' + names.join(', '), 'ok');
 
-      idleName = names.find(n => n.toLowerCase() === 'idle') ?? names[0] ?? null;
+      idleName = names.find(n => n.toLowerCase() === 'idle')
+        ?? names.find(n => n.toLowerCase() === 'action')
+        ?? names[0]
+        ?? null;
       AC._idleName = idleName;
       dbg('idleName: ' + idleName, 'ok');
 
@@ -770,7 +790,10 @@ export default function TextToFSLScreen() {
               contentContainerStyle={styles.signsScroll}
             >
               {animNames
-                .filter(n => n.toLowerCase() !== 'idle')
+                .filter(n => {
+                  const lower = n.toLowerCase();
+                  return lower !== 'idle' && lower !== 'action';
+                })
                 .map((name, index) => {
                   const isActive = playingChip === name;
                   const isIdleLoop = idleName === name;
