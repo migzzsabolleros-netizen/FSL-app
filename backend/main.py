@@ -242,6 +242,9 @@ class UserRegister(BaseModel):
     username: str
     email: str
     password: str
+    first_name: Optional[str] = None
+    middle_name: Optional[str] = None
+    last_name: Optional[str] = None
     bio: Optional[str] = None
     profile_image: Optional[str] = None
 
@@ -255,6 +258,9 @@ class UserProfileUpdate(BaseModel):
     current_email: Optional[str] = None
     email: str
     username: Optional[str] = None
+    first_name: Optional[str] = None
+    middle_name: Optional[str] = None
+    last_name: Optional[str] = None
     bio: Optional[str] = None
     profile_image: Optional[str] = None
 
@@ -269,6 +275,9 @@ def build_user_response(db_user):
     return {
         "name": db_user.get("username") or db_user.get("name") or "",
         "email": db_user.get("email") or "",
+        "firstName": db_user.get("first_name") or db_user.get("firstName") or "",
+        "middleName": db_user.get("middle_name") or db_user.get("middleName") or "",
+        "lastName": db_user.get("last_name") or db_user.get("lastName") or "",
         "bio": db_user.get("bio") or "",
         "profileImage": db_user.get("profile_image") or db_user.get("profileImage") or "",
     }
@@ -741,6 +750,12 @@ def register_user(user: UserRegister):
         "email": user.email,
         "password_hash": hashed,
     }
+    if user.first_name is not None:
+        insert_payload["first_name"] = user.first_name
+    if user.middle_name is not None:
+        insert_payload["middle_name"] = user.middle_name
+    if user.last_name is not None:
+        insert_payload["last_name"] = user.last_name
     if user.bio is not None:
         insert_payload["bio"] = user.bio
     if user.profile_image is not None:
@@ -785,6 +800,12 @@ def update_profile(profile: UserProfileUpdate):
         update_payload["username"] = profile.username
     if profile.email is not None:
         update_payload["email"] = profile.email
+    if profile.first_name is not None:
+        update_payload["first_name"] = profile.first_name
+    if profile.middle_name is not None:
+        update_payload["middle_name"] = profile.middle_name
+    if profile.last_name is not None:
+        update_payload["last_name"] = profile.last_name
     if profile.bio is not None:
         update_payload["bio"] = profile.bio
     if profile.profile_image is not None:
