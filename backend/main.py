@@ -1,4 +1,4 @@
-﻿import base64
+import base64
 import json
 import os
 import threading
@@ -109,15 +109,16 @@ KEYPOINT_COUNT = FEATURE_SIZE
 MIN_SEQUENCE_FRAMES = 3
 MIN_HAND_DETECTION_CONFIDENCE = 0.42
 MIN_TRACKING_HAND_CONFIDENCE = 0.18
-TRANSLATION_THRESHOLD = 0.40
+# ---- Tuned thresholds (faster response, fewer false positives) ----
+TRANSLATION_THRESHOLD = 0.52          # raised from 0.40 — avoids noisy low-confidence fires
 TEMPORAL_SMOOTHING = 1
 MAX_IMAGE_WIDTH = 320
 MAX_MISSED_HAND_FRAMES = 2
 KEYPOINT_SMOOTHING_ALPHA = 0.8
 TOP_K_TO_RETURN = 3
 DYNAMIC_SIGN_LABELS = {"j", "z"}
-QUICK_STATIC_FRAMES = 3
-QUICK_STATIC_THRESHOLD = 0.48
+QUICK_STATIC_FRAMES = 2              # lowered from 3 — triggers fast path sooner
+QUICK_STATIC_THRESHOLD = 0.55        # raised from 0.48 — only accept early if confident
 QUICK_STATIC_DURING_MOTION_THRESHOLD = 0.62
 STATIC_MOTION_THRESHOLD = 0.006
 STATIC_SETTLE_FRAMES = 1
@@ -188,18 +189,38 @@ if os.path.exists(LABELS_PATH):
     with open(LABELS_PATH, "r", encoding="utf-8") as labels_file:
         SIGNS = json.load(labels_file)
 
+# ---- FIX: pad with None instead of "class_N" so unknown outputs are filterable ----
 if len(SIGNS) != MODEL_OUTPUT_COUNT:
-    print(
-        f"Warning: label count {len(SIGNS)} does not match model output "
-        f"{MODEL_OUTPUT_COUNT}. Adjusting labels for runtime."
-    )
     if len(SIGNS) > MODEL_OUTPUT_COUNT:
+        print(
+            f"⚠️  LABEL MISMATCH: labels.json has {len(SIGNS)} entries but model outputs "
+            f"{MODEL_OUTPUT_COUNT} classes. Truncating labels."
+        )
         SIGNS = SIGNS[:MODEL_OUTPUT_COUNT]
     else:
-        SIGNS = SIGNS + [f"class_{i}" for i in range(len(SIGNS), MODEL_OUTPUT_COUNT)]
+        missing = MODEL_OUTPUT_COUNT - len(SIGNS)
+        print(
+            f"⚠️  LABEL MISMATCH: labels.json has {len(SIGNS)} entries but model outputs "
+            f"{MODEL_OUTPUT_COUNT} classes. Missing {missing} labels — update your labels.json! "
+            f"Padding with None so unknown outputs are silently filtered."
+        )
+        SIGNS = SIGNS + [None] * missing
 
 MIN_SEQUENCE_FRAMES = min(MIN_SEQUENCE_FRAMES, SEQUENCE_LENGTH)
-print(f"SignBridge v2 model loaded: input=({SEQUENCE_LENGTH}, {KEYPOINT_COUNT}), labels={SIGNS}")
+known_signs = [s for s in SIGNS if s is not None]
+print(f"SignBridge v2 model loaded: input=({SEQUENCE_LENGTH}, {KEYPOINT_COUNT}), "
+      f"labels={len(known_signs)} known / {len(SIGNS)} total outputs")
+
+
+# ---- Helpers ----
+
+def _is_placeholder(candidate) -> bool:
+    """Return True if the candidate label is None or an auto-padded placeholder."""
+    if candidate is None:
+        return True
+    if isinstance(candidate, str) and candidate.startswith("class_") and candidate[6:].isdigit():
+        return True
+    return False
 
 
 # ---- Sequence buffers ----
@@ -278,7 +299,7 @@ def build_top_predictions(prediction: np.ndarray):
     top_indices = np.argsort(prediction)[-TOP_K_TO_RETURN:][::-1]
     top = []
     for idx in top_indices:
-        if idx < len(SIGNS):
+        if idx < len(SIGNS) and not _is_placeholder(SIGNS[idx]):
             top.append({"sign": SIGNS[idx], "confidence": round(float(prediction[idx]) * 100, 1)})
     return top
 
@@ -292,8 +313,10 @@ def reset_dynamic_state():
     stable_static_frames = 0
 
 
-def is_dynamic_label(sign: str) -> bool:
-    return sign.lower() in DYNAMIC_SIGN_LABELS
+def is_dynamic_label(sign) -> bool:
+    if sign is None:
+        return False
+    return str(sign).lower() in DYNAMIC_SIGN_LABELS
 
 
 def try_quick_static_prediction(sequence_array, landmarks, motion, hand_confidence, threshold, timing=None):
@@ -322,7 +345,8 @@ def try_quick_static_prediction(sequence_array, landmarks, motion, hand_confiden
     confidence = float(prediction[index])
     candidate = SIGNS[index]
 
-    if is_dynamic_label(candidate) or confidence < threshold:
+    # FIX: reject placeholder/None labels, dynamic labels, and low-confidence results
+    if _is_placeholder(candidate) or is_dynamic_label(candidate) or confidence < threshold:
         return None
 
     with sequence_lock:
@@ -383,15 +407,22 @@ def predict_sequence(sequence_array, landmarks, motion, hand_confidence, gesture
     index = int(np.argmax(smoothed))
     confidence = float(smoothed[index])
     candidate = SIGNS[index]
-    translation = candidate if confidence >= threshold else ""
+
+    # FIX: never surface placeholder/None labels
+    if _is_placeholder(candidate):
+        candidate = ""
+        translation = ""
+    else:
+        translation = candidate if confidence >= threshold else ""
+
     top_predictions = build_top_predictions(smoothed)
 
     if translation:
         message = "OK"
     elif gesture_type == "dynamic":
-        message = f"Try the moving sign again: {candidate}"
+        message = f"Try the moving sign again{': ' + candidate if candidate else ''}"
     else:
-        message = f"Hold sign steady: {candidate}"
+        message = f"Hold sign steady{': ' + candidate if candidate else ''}"
 
     if gesture_type == "dynamic":
         with sequence_lock:
@@ -712,7 +743,7 @@ def root():
     return {
         "message": "SignBridge+ API is running!",
         "model": "signbridge_model_v2.h5",
-        "labels": SIGNS,
+        "labels": [s for s in SIGNS if s is not None],
         "sequence_length": SEQUENCE_LENGTH,
         "feature_size": KEYPOINT_COUNT,
     }
