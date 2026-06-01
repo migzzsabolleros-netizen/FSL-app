@@ -6,6 +6,7 @@ import time
 from collections import deque
 from typing import Optional
 
+import importlib
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -16,12 +17,21 @@ from fastapi.responses import FileResponse
 from passlib.context import CryptContext
 from pydantic import BaseModel
 from supabase import Client, create_client
-import gdown
+
+try:
+    gdown = importlib.import_module("gdown")
+except ImportError:
+    gdown = None
 
 MODEL_PATH = "/app/models/signbridge_model_v2.h5"
 
 if not os.path.exists(MODEL_PATH):
     os.makedirs("/app/models", exist_ok=True)
+    if gdown is None:
+        raise RuntimeError(
+            "Model file not found and `gdown` is not installed. "
+            "Install gdown or place signbridge_model_v2.h5 at /app/models."
+        )
     gdown.download(
         "https://drive.google.com/uc?id=1zh5R0GXlR96OUSOw-ujnCrl_Zpl2Qrl4",
         MODEL_PATH,
@@ -263,6 +273,17 @@ class UserProfileUpdate(BaseModel):
     last_name: Optional[str] = None
     bio: Optional[str] = None
     profile_image: Optional[str] = None
+
+
+class UserChangePassword(BaseModel):
+    email: str
+    current_password: str
+    new_password: str
+
+
+class UserDeleteAccount(BaseModel):
+    email: str
+    current_password: str
 
 
 class TranslateRequest(BaseModel):
@@ -823,6 +844,41 @@ def update_profile(profile: UserProfileUpdate):
         "message": "Profile updated successfully",
         "user": build_user_response(db_user),
     }
+
+
+@app.post("/change-password")
+def change_password(request: UserChangePassword):
+    result = supabase.table("users").select("*").eq("email", request.email).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    db_user = result.data[0]
+    if not pwd_context.verify(request.current_password, db_user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid current password")
+
+    if len(request.new_password.encode("utf-8")) > 72:
+        raise HTTPException(status_code=400, detail="Password must be 72 characters or less")
+    if len(request.new_password) < 8:
+        raise HTTPException(status_code=400, detail="New password must be at least 8 characters")
+
+    hashed = pwd_context.hash(request.new_password)
+    supabase.table("users").update({"password_hash": hashed}).eq("email", request.email).execute()
+
+    return {"message": "Password changed successfully"}
+
+
+@app.post("/delete-account")
+def delete_account(request: UserDeleteAccount):
+    result = supabase.table("users").select("*").eq("email", request.email).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    db_user = result.data[0]
+    if not pwd_context.verify(request.current_password, db_user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid current password")
+
+    supabase.table("users").delete().eq("email", request.email).execute()
+    return {"message": "Account deleted successfully"}
 
 
 @app.get("/")
