@@ -2,6 +2,7 @@
 import json
 import os
 import threading
+import time
 from collections import deque
 
 import cv2
@@ -105,12 +106,12 @@ LABELS_PATH = os.path.join(MODEL_DIR, CONFIG_LABELS_PATH)
 
 SEQUENCE_LENGTH = CONFIG_SEQUENCE_LENGTH
 KEYPOINT_COUNT = FEATURE_SIZE
-MIN_SEQUENCE_FRAMES = 4
+MIN_SEQUENCE_FRAMES = 3
 MIN_HAND_DETECTION_CONFIDENCE = 0.42
 MIN_TRACKING_HAND_CONFIDENCE = 0.18
 TRANSLATION_THRESHOLD = 0.40
 TEMPORAL_SMOOTHING = 1
-MAX_IMAGE_WIDTH = 512
+MAX_IMAGE_WIDTH = 320
 MAX_MISSED_HAND_FRAMES = 2
 KEYPOINT_SMOOTHING_ALPHA = 0.8
 TOP_K_TO_RETURN = 3
@@ -163,6 +164,17 @@ pose = mp_pose.Pose(
 # ---- Model ----
 print(f"Loading SignBridge v2 model from {MODEL_PATH}...")
 model = tf.keras.models.load_model(MODEL_PATH, compile=False)
+
+@tf.function
+def _predict_fn(input_tensor):
+    return model(input_tensor, training=False)
+
+
+def run_model_inference(input_array):
+    tensor = tf.convert_to_tensor(input_array, dtype=tf.float32)
+    prediction = _predict_fn(tensor)
+    return prediction.numpy()[0]
+
 
 model_input_shape = model.input_shape[0] if isinstance(model.input_shape, list) else model.input_shape
 if len(model_input_shape) >= 3:
@@ -284,7 +296,7 @@ def is_dynamic_label(sign: str) -> bool:
     return sign.lower() in DYNAMIC_SIGN_LABELS
 
 
-def try_quick_static_prediction(sequence_array, landmarks, motion, hand_confidence, threshold):
+def try_quick_static_prediction(sequence_array, landmarks, motion, hand_confidence, threshold, timing=None):
     if len(sequence_array) < QUICK_STATIC_FRAMES:
         return None
 
@@ -296,8 +308,12 @@ def try_quick_static_prediction(sequence_array, landmarks, motion, hand_confiden
     if normalized.shape != (SEQUENCE_LENGTH, KEYPOINT_COUNT):
         return None
 
+    if timing is not None:
+        inference_start = time.time()
     with model_lock:
-        prediction = model.predict(np.expand_dims(normalized, axis=0), verbose=0)[0]
+        prediction = run_model_inference(np.expand_dims(normalized, axis=0))
+    if timing is not None:
+        timing["model_inference"] = (time.time() - inference_start) * 1000
 
     if len(prediction) != len(SIGNS):
         return None
@@ -330,7 +346,7 @@ def try_quick_static_prediction(sequence_array, landmarks, motion, hand_confiden
     }
 
 
-def predict_sequence(sequence_array, landmarks, motion, hand_confidence, gesture_type):
+def predict_sequence(sequence_array, landmarks, motion, hand_confidence, gesture_type, timing=None):
     sequence_array = normalize_sequence_length(sequence_array, target_length=SEQUENCE_LENGTH)
     if sequence_array.shape != (SEQUENCE_LENGTH, KEYPOINT_COUNT):
         with sequence_lock:
@@ -338,14 +354,18 @@ def predict_sequence(sequence_array, landmarks, motion, hand_confidence, gesture
             prediction_history.clear()
             keypoint_smoother.reset()
             reset_dynamic_state()
-        return empty_translate_response("Resetting sign reader", landmarks=landmarks)
+        return empty_translate_response("Resetting sign reader", landmarks=landmarks, timing=timing)
 
+    if timing is not None:
+        inference_start = time.time()
     with model_lock:
-        prediction = model.predict(np.expand_dims(sequence_array, axis=0), verbose=0)[0]
+        prediction = run_model_inference(np.expand_dims(sequence_array, axis=0))
+    if timing is not None:
+        timing["model_inference"] = (time.time() - inference_start) * 1000
 
     if len(prediction) != len(SIGNS):
         return {
-            **empty_translate_response("Model output size mismatch", landmarks=landmarks),
+            **empty_translate_response("Model output size mismatch", landmarks=landmarks, timing=timing),
             "error": True,
             "model_outputs": len(prediction),
             "labels": len(SIGNS),
@@ -393,8 +413,8 @@ def predict_sequence(sequence_array, landmarks, motion, hand_confidence, gesture
     }
 
 
-def empty_translate_response(message: str, landmarks=None, buffering=False, progress=0, total=None):
-    return {
+def empty_translate_response(message: str, landmarks=None, buffering=False, progress=0, total=None, timing=None):
+    response = {
         "translation": "",
         "candidate": "",
         "confidence": 0.0,
@@ -405,6 +425,16 @@ def empty_translate_response(message: str, landmarks=None, buffering=False, prog
         "landmarks": landmarks or {"hands": [], "pose": []},
         "top_predictions": [],
     }
+    if timing is not None:
+        response["_timing_ms"] = timing
+    return response
+
+
+def attach_timing(response, timings):
+    if timings is not None:
+        timings["total"] = (time.time() - timings["start"]) * 1000
+        response["_timing_ms"] = timings
+    return response
 
 
 # ---- Endpoints ----
@@ -437,18 +467,25 @@ def translate_image(request: TranslateRequest):
 def translate_image_frame(request: TranslateRequest):
     global missed_hand_frames, dynamic_active, dynamic_idle_frames, dynamic_motion_streak, stable_static_frames
 
-    image = decode_image(request.image_base64)
-    image = resize_for_inference(image)
+    frame_start = time.time()
+    timings = {"start": frame_start}
 
+    image = decode_image(request.image_base64)
+    timings["decode"] = (time.time() - frame_start) * 1000
+
+    image = resize_for_inference(image)
     if request.facing.lower() == "front":
         image = cv2.flip(image, 1)
 
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     rgb.flags.writeable = False
+    timings["image_prep"] = (time.time() - frame_start - timings["decode"]) * 1000
 
+    mp_start = time.time()
     with mp_lock:
         hand_res = hands.process(rgb)
         pose_res = pose.process(rgb)
+    timings["mediapipe"] = (time.time() - mp_start) * 1000
 
     landmarks = get_landmarks_for_drawing(hand_res, pose_res) if request.include_landmarks else {"hands": [], "pose": []}
     hand_confidence = hand_detection_confidence(hand_res)
@@ -490,23 +527,27 @@ def translate_image_frame(request: TranslateRequest):
                 motion=0.0,
                 hand_confidence=hand_confidence,
                 gesture_type="dynamic",
+                timing=timings,
             )
 
         if capturing_dynamic and missed_hand_frames < DYNAMIC_MAX_MISSED_FRAMES:
-            return empty_translate_response(
+            return attach_timing(empty_translate_response(
                 "Capturing moving sign...",
                 landmarks=landmarks,
                 buffering=True,
                 progress=min(dynamic_progress, MIN_DYNAMIC_FRAMES),
                 total=MIN_DYNAMIC_FRAMES,
-            )
+                timing=timings,
+            ), timings)
 
-        return empty_translate_response(
+        return attach_timing(empty_translate_response(
             "Show your hand clearly in the camera",
             landmarks=landmarks,
             buffering=buffered < MIN_SEQUENCE_FRAMES,
             progress=buffered,
-        )
+            timing=timings,
+        ), timings)
+
 
     keypoints = extract_keypoints(hand_res, pose_res)
     if keypoints.shape[0] != KEYPOINT_COUNT:
@@ -514,7 +555,7 @@ def translate_image_frame(request: TranslateRequest):
             frame_sequence.clear()
             prediction_history.clear()
             keypoint_smoother.reset()
-        return empty_translate_response("Resetting sign reader")
+        return attach_timing(empty_translate_response("Resetting sign reader", timing=timings), timings)
 
     with sequence_lock:
         missed_hand_frames = 0
@@ -578,6 +619,7 @@ def translate_image_frame(request: TranslateRequest):
             motion=motion,
             hand_confidence=hand_confidence,
             gesture_type="dynamic",
+            timing=timings,
         )
 
     if can_try_quick_static:
@@ -587,26 +629,29 @@ def translate_image_frame(request: TranslateRequest):
             motion=motion,
             hand_confidence=hand_confidence,
             threshold=quick_static_threshold,
+            timing=timings,
         )
         if quick_static is not None:
-            return quick_static
+            return attach_timing(quick_static, timings)
 
     if dynamic_active:
-        return empty_translate_response(
+        return attach_timing(empty_translate_response(
             "Capturing moving sign...",
             landmarks=landmarks,
             buffering=True,
             progress=min(dynamic_progress, MIN_DYNAMIC_FRAMES),
             total=MIN_DYNAMIC_FRAMES,
-        )
+            timing=timings,
+        ), timings)
 
     if buffered < MIN_SEQUENCE_FRAMES:
-        return empty_translate_response(
+        return attach_timing(empty_translate_response(
             f"Reading sign ({buffered}/{MIN_SEQUENCE_FRAMES})",
             landmarks=landmarks,
             buffering=True,
             progress=buffered,
-        )
+            timing=timings,
+        ), timings)
 
     return predict_sequence(
         static_sequence_array,
@@ -614,6 +659,7 @@ def translate_image_frame(request: TranslateRequest):
         motion=motion,
         hand_confidence=hand_confidence,
         gesture_type=classify_gesture_type(static_sequence_array),
+        timing=timings,
     )
 
 
