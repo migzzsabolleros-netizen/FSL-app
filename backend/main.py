@@ -4,6 +4,7 @@ import os
 import threading
 import time
 from collections import deque
+from typing import Optional
 
 import cv2
 import mediapipe as mp
@@ -241,6 +242,8 @@ class UserRegister(BaseModel):
     username: str
     email: str
     password: str
+    bio: Optional[str] = None
+    profile_image: Optional[str] = None
 
 
 class UserLogin(BaseModel):
@@ -248,10 +251,27 @@ class UserLogin(BaseModel):
     password: str
 
 
+class UserProfileUpdate(BaseModel):
+    current_email: Optional[str] = None
+    email: str
+    username: Optional[str] = None
+    bio: Optional[str] = None
+    profile_image: Optional[str] = None
+
+
 class TranslateRequest(BaseModel):
     image_base64: str
     facing: str = "front"
     include_landmarks: bool = False
+
+
+def build_user_response(db_user):
+    return {
+        "name": db_user.get("username") or db_user.get("name") or "",
+        "email": db_user.get("email") or "",
+        "bio": db_user.get("bio") or "",
+        "profileImage": db_user.get("profile_image") or db_user.get("profileImage") or "",
+    }
 
 
 # ---- Helpers ----
@@ -716,13 +736,22 @@ def register_user(user: UserRegister):
         raise HTTPException(status_code=400, detail="Email already registered")
 
     hashed = pwd_context.hash(user.password)
-    supabase.table("users").insert({
+    insert_payload = {
         "username": user.username,
         "email": user.email,
         "password_hash": hashed,
-    }).execute()
+    }
+    if user.bio is not None:
+        insert_payload["bio"] = user.bio
+    if user.profile_image is not None:
+        insert_payload["profile_image"] = user.profile_image
 
-    return {"message": "User registered successfully"}
+    supabase.table("users").insert(insert_payload).execute()
+
+    return {
+        "message": "User registered successfully",
+        "user": build_user_response(insert_payload),
+    }
 
 
 @app.post("/login")
@@ -735,7 +764,44 @@ def login_user(user: UserLogin):
     if not pwd_context.verify(user.password, db_user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    return {"message": "Login successful", "username": db_user["username"]}
+    return {
+        "message": "Login successful",
+        "user": build_user_response(db_user),
+    }
+
+
+@app.post("/update-profile")
+def update_profile(profile: UserProfileUpdate):
+    identifier_email = profile.current_email or profile.email
+    if not identifier_email:
+        raise HTTPException(status_code=400, detail="Missing current_email or email")
+
+    result = supabase.table("users").select("*").eq("email", identifier_email).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    update_payload = {}
+    if profile.username is not None:
+        update_payload["username"] = profile.username
+    if profile.email is not None:
+        update_payload["email"] = profile.email
+    if profile.bio is not None:
+        update_payload["bio"] = profile.bio
+    if profile.profile_image is not None:
+        update_payload["profile_image"] = profile.profile_image
+
+    if not update_payload:
+        raise HTTPException(status_code=400, detail="No profile fields to update")
+
+    supabase.table("users").update(update_payload).eq("email", identifier_email).execute()
+
+    updated = supabase.table("users").select("*").eq("email", update_payload.get("email", identifier_email)).execute()
+    db_user = updated.data[0] if updated.data else result.data[0]
+
+    return {
+        "message": "Profile updated successfully",
+        "user": build_user_response(db_user),
+    }
 
 
 @app.get("/")
